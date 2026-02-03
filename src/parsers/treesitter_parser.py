@@ -4,6 +4,7 @@ import os
 import re
 from pathlib import Path
 
+from src.config.settings import settings
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -22,6 +23,21 @@ JAVA_METHOD_RE = re.compile(
     r"^\s*(?:public|protected|private|static|final|synchronized|abstract|native|strictfp|default|\s)+"
     r"[A-Za-z0-9_<>\[\],\s]+\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\("
 )
+
+
+def _iter_line_chunks(lines: list[str], chunk_size: int, overlap: int) -> list[tuple[int, int]]:
+    if chunk_size <= 0:
+        return [(0, len(lines))]
+    overlap = max(0, min(overlap, chunk_size - 1))
+    chunks: list[tuple[int, int]] = []
+    start = 0
+    while start < len(lines):
+        end = min(len(lines), start + chunk_size)
+        chunks.append((start, end))
+        if end >= len(lines):
+            break
+        start = end - overlap
+    return chunks
 
 
 def _iter_code_files(repo_path: str, extensions: set[str]) -> list[Path]:
@@ -60,6 +76,7 @@ def _extract_units_from_file(file_path: Path, repo_root: Path) -> list[dict]:
         "type": "file",
         "name": file_path.name,
         "file_path": rel_path,
+        "embed": False,
         "code": content,
         "edges": [],
     }
@@ -79,6 +96,7 @@ def _extract_units_from_file(file_path: Path, repo_root: Path) -> list[dict]:
                         "type": "function",
                         "name": name,
                         "file_path": rel_path,
+                        "embed": False,
                         "code": line.strip(),
                         "edges": [],
                     }
@@ -95,6 +113,7 @@ def _extract_units_from_file(file_path: Path, repo_root: Path) -> list[dict]:
                         "type": "class",
                         "name": name,
                         "file_path": rel_path,
+                        "embed": False,
                         "code": line.strip(),
                         "edges": [],
                     }
@@ -125,6 +144,7 @@ def _extract_units_from_file(file_path: Path, repo_root: Path) -> list[dict]:
                         "type": "class",
                         "name": name,
                         "file_path": rel_path,
+                        "embed": False,
                         "code": line.strip(),
                         "edges": [],
                     }
@@ -141,6 +161,7 @@ def _extract_units_from_file(file_path: Path, repo_root: Path) -> list[dict]:
                         "type": "function",
                         "name": name,
                         "file_path": rel_path,
+                        "embed": False,
                         "code": line.strip(),
                         "edges": [],
                     }
@@ -171,6 +192,7 @@ def _extract_units_from_file(file_path: Path, repo_root: Path) -> list[dict]:
                         "type": "function",
                         "name": name,
                         "file_path": rel_path,
+                        "embed": False,
                         "code": line.strip(),
                         "edges": [],
                     }
@@ -187,6 +209,7 @@ def _extract_units_from_file(file_path: Path, repo_root: Path) -> list[dict]:
                         "type": "class",
                         "name": name,
                         "file_path": rel_path,
+                        "embed": False,
                         "code": line.strip(),
                         "edges": [],
                     }
@@ -204,6 +227,33 @@ def _extract_units_from_file(file_path: Path, repo_root: Path) -> list[dict]:
                             "type": "imports",
                         }
                     )
+
+    chunk_spans = _iter_line_chunks(
+        lines,
+        chunk_size=settings.chunk_size_lines,
+        overlap=settings.chunk_overlap_lines,
+    )
+    for chunk_index, (start, end) in enumerate(chunk_spans):
+        chunk_id = f"{file_node_id}::chunk::{chunk_index}"
+        chunk_code = "\n".join(lines[start:end]).strip()
+        if not chunk_code:
+            continue
+        units.append(
+            {
+                "id": chunk_id,
+                "type": "chunk",
+                "name": f"chunk_{chunk_index}",
+                "file_path": rel_path,
+                "start_line": start + 1,
+                "end_line": end,
+                "embed": True,
+                "code": chunk_code,
+                "edges": [],
+            }
+        )
+        file_unit["edges"].append(
+            {"source": file_node_id, "target": chunk_id, "type": "contains"}
+        )
 
     units.append(file_unit)
     return units
