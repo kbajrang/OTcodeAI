@@ -21,3 +21,8 @@ class FaissStore:
 
     def load(self) -> None:
         self.index = faiss.read_index(settings.vector_db_path)
+
+    def search(self, vector: list[float], k: int = 5) -> tuple[list[float], list[int]]:
+        arr = np.array([vector], dtype="float32")
+        scores, indices = self.index.search(arr, k)
+        return scores[0].tolist(), indices[0].tolist()
