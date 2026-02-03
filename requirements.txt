@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+streamlit
+networkx
+llama-index
+faiss-cpu
+sentence-transformers
+numpy
+python-dotenv
+pydantic
+pydantic-settings
+tree-sitter
