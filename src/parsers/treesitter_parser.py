@@ -8,17 +8,38 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-PY_FUNCTION_RE = re.compile(r"^\\s*def\\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\\s*\\(")
-PY_CLASS_RE = re.compile(r"^\\s*class\\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\\s*[(:]")
-PY_IMPORT_RE = re.compile(r"^\\s*(?:from\\s+(?P<from>[A-Za-z0-9_\\.]+)\\s+import|import\\s+(?P<import>[A-Za-z0-9_\\.]+))")
-JS_FUNCTION_RE = re.compile(r"\\bfunction\\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\\s*\\(")
-JS_CLASS_RE = re.compile(r"\\bclass\\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\\b")
-JS_IMPORT_RE = re.compile(r"\\bimport\\s+.*?from\\s+[\"'](?P<module>[^\"']+)[\"']")
+PY_FUNCTION_RE = re.compile(r"^\s*def\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(")
+PY_CLASS_RE = re.compile(r"^\s*class\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*[(:]")
+PY_IMPORT_RE = re.compile(
+    r"^\s*(?:from\s+(?P<from>[A-Za-z0-9_\.]+)\s+import|import\s+(?P<import>[A-Za-z0-9_\.]+))"
+)
+JS_FUNCTION_RE = re.compile(r"\bfunction\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(")
+JS_CLASS_RE = re.compile(r"\bclass\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b")
+JS_IMPORT_RE = re.compile(r"\bimport\s+.*?from\s+[\"'](?P<module>[^\"']+)[\"']")
+JAVA_CLASS_RE = re.compile(r"\bclass\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b")
+JAVA_IMPORT_RE = re.compile(r"^\s*import\s+(?P<module>[A-Za-z0-9_\.\*]+)\s*;")
+JAVA_METHOD_RE = re.compile(
+    r"^\s*(?:public|protected|private|static|final|synchronized|abstract|native|strictfp|default|\s)+"
+    r"[A-Za-z0-9_<>\[\],\s]+\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
 
 
 def _iter_code_files(repo_path: str, extensions: set[str]) -> list[Path]:
     files: list[Path] = []
-    for root, _, filenames in os.walk(repo_path):
+    ignore_dirs = {
+        ".git",
+        ".idea",
+        ".openapi-generator",
+        ".venv",
+        "venv",
+        "node_modules",
+        "dist",
+        "build",
+        "target",
+        "__pycache__",
+    }
+    for root, dirnames, filenames in os.walk(repo_path):
+        dirnames[:] = [d for d in dirnames if d not in ignore_dirs]
         for name in filenames:
             if any(name.endswith(ext) for ext in extensions):
                 files.append(Path(root) / name)
@@ -91,6 +112,52 @@ def _extract_units_from_file(file_path: Path, repo_root: Path) -> list[dict]:
                             "type": "imports",
                         }
                     )
+        elif file_path.suffix == ".java":
+            match_class = JAVA_CLASS_RE.search(line)
+            match_import = JAVA_IMPORT_RE.match(line)
+            match_method = JAVA_METHOD_RE.match(line)
+            if match_class:
+                name = match_class.group("name")
+                unit_id = f"{file_node_id}::class::{name}"
+                units.append(
+                    {
+                        "id": unit_id,
+                        "type": "class",
+                        "name": name,
+                        "file_path": rel_path,
+                        "code": line.strip(),
+                        "edges": [],
+                    }
+                )
+                file_unit["edges"].append(
+                    {"source": file_node_id, "target": unit_id, "type": "contains"}
+                )
+            if match_method:
+                name = match_method.group("name")
+                unit_id = f"{file_node_id}::function::{name}"
+                units.append(
+                    {
+                        "id": unit_id,
+                        "type": "function",
+                        "name": name,
+                        "file_path": rel_path,
+                        "code": line.strip(),
+                        "edges": [],
+                    }
+                )
+                file_unit["edges"].append(
+                    {"source": file_node_id, "target": unit_id, "type": "contains"}
+                )
+            if match_import:
+                module_name = match_import.group("module")
+                if module_name:
+                    file_unit["edges"].append(
+                        {
+                            "source": file_node_id,
+                            "target": f"module::{module_name}",
+                            "type": "imports",
+                        }
+                    )
         else:
             match_func = JS_FUNCTION_RE.search(line)
             match_class = JS_CLASS_RE.search(line)
@@ -146,7 +213,7 @@ def parse_repository(repo_path: str) -> list[dict]:
     """Parse code and return a list of structured units."""
     logger.info("Parsing repository at %s", repo_path)
     repo_root = Path(repo_path)
-    extensions = {".py", ".js", ".ts"}
+    extensions = {".py", ".js", ".ts", ".java"}
     units: list[dict] = []
     for file_path in _iter_code_files(repo_path, extensions):
         units.extend(_extract_units_from_file(file_path, repo_root))

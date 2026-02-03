@@ -10,3 +10,13 @@ pipeline = GraphRAGPipeline()
 def query(request: QueryRequest) -> QueryResponse:
     result = pipeline.answer(request.question)
     return QueryResponse(answer=result)
+
+
+@router.get("/")
+def root() -> dict:
+    return {"status": "ok", "message": "GraphRAG API is running"}
+
+
+@router.get("/health")
+def health() -> dict:
+    return {"status": "ok"}

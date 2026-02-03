@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Models
-    llm_model: str = "codellama:13b"
+    llm_model: str = "codellama:13b-instruct"
     embedding_model: str = "BAAI/bge-base-en"
     ollama_base_url: str = "http://localhost:11434"
 
@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     vector_metadata_path: str = "data/vector/metadata.json"
 
     # Parsing
-    languages: list[str] = ["python", "javascript", "typescript"]
+    languages: list[str] = ["python", "javascript", "typescript", "java"]
 
     # Server
     api_host: str = "0.0.0.0"
