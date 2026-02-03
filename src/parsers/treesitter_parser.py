@@ -1,12 +1,154 @@
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+PY_FUNCTION_RE = re.compile(r"^\\s*def\\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\\s*\\(")
+PY_CLASS_RE = re.compile(r"^\\s*class\\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\\s*[(:]")
+PY_IMPORT_RE = re.compile(r"^\\s*(?:from\\s+(?P<from>[A-Za-z0-9_\\.]+)\\s+import|import\\s+(?P<import>[A-Za-z0-9_\\.]+))")
+JS_FUNCTION_RE = re.compile(r"\\bfunction\\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\\s*\\(")
+JS_CLASS_RE = re.compile(r"\\bclass\\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\\b")
+JS_IMPORT_RE = re.compile(r"\\bimport\\s+.*?from\\s+[\"'](?P<module>[^\"']+)[\"']")
+
+
+def _iter_code_files(repo_path: str, extensions: set[str]) -> list[Path]:
+    files: list[Path] = []
+    for root, _, filenames in os.walk(repo_path):
+        for name in filenames:
+            if any(name.endswith(ext) for ext in extensions):
+                files.append(Path(root) / name)
+    return files
+
+
+def _extract_units_from_file(file_path: Path, repo_root: Path) -> list[dict]:
+    units: list[dict] = []
+    rel_path = str(file_path.relative_to(repo_root))
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        content = file_path.read_text(encoding="latin-1")
+
+    file_node_id = f"file::{rel_path}"
+    file_unit = {
+        "id": file_node_id,
+        "type": "file",
+        "name": file_path.name,
+        "file_path": rel_path,
+        "code": content,
+        "edges": [],
+    }
+
+    lines = content.splitlines()
+    for line in lines:
+        if file_path.suffix == ".py":
+            match_func = PY_FUNCTION_RE.match(line)
+            match_class = PY_CLASS_RE.match(line)
+            match_import = PY_IMPORT_RE.match(line)
+            if match_func:
+                name = match_func.group("name")
+                unit_id = f"{file_node_id}::function::{name}"
+                units.append(
+                    {
+                        "id": unit_id,
+                        "type": "function",
+                        "name": name,
+                        "file_path": rel_path,
+                        "code": line.strip(),
+                        "edges": [],
+                    }
+                )
+                file_unit["edges"].append(
+                    {"source": file_node_id, "target": unit_id, "type": "contains"}
+                )
+            if match_class:
+                name = match_class.group("name")
+                unit_id = f"{file_node_id}::class::{name}"
+                units.append(
+                    {
+                        "id": unit_id,
+                        "type": "class",
+                        "name": name,
+                        "file_path": rel_path,
+                        "code": line.strip(),
+                        "edges": [],
+                    }
+                )
+                file_unit["edges"].append(
+                    {"source": file_node_id, "target": unit_id, "type": "contains"}
+                )
+            if match_import:
+                module_name = match_import.group("from") or match_import.group("import")
+                if module_name:
+                    file_unit["edges"].append(
+                        {
+                            "source": file_node_id,
+                            "target": f"module::{module_name}",
+                            "type": "imports",
+                        }
+                    )
+        else:
+            match_func = JS_FUNCTION_RE.search(line)
+            match_class = JS_CLASS_RE.search(line)
+            match_import = JS_IMPORT_RE.search(line)
+            if match_func:
+                name = match_func.group("name")
+                unit_id = f"{file_node_id}::function::{name}"
+                units.append(
+                    {
+                        "id": unit_id,
+                        "type": "function",
+                        "name": name,
+                        "file_path": rel_path,
+                        "code": line.strip(),
+                        "edges": [],
+                    }
+                )
+                file_unit["edges"].append(
+                    {"source": file_node_id, "target": unit_id, "type": "contains"}
+                )
+            if match_class:
+                name = match_class.group("name")
+                unit_id = f"{file_node_id}::class::{name}"
+                units.append(
+                    {
+                        "id": unit_id,
+                        "type": "class",
+                        "name": name,
+                        "file_path": rel_path,
+                        "code": line.strip(),
+                        "edges": [],
+                    }
+                )
+                file_unit["edges"].append(
+                    {"source": file_node_id, "target": unit_id, "type": "contains"}
+                )
+            if match_import:
+                module_name = match_import.group("module")
+                if module_name:
+                    file_unit["edges"].append(
+                        {
+                            "source": file_node_id,
+                            "target": f"module::{module_name}",
+                            "type": "imports",
+                        }
+                    )
+
+    units.append(file_unit)
+    return units
+
 
 def parse_repository(repo_path: str) -> list[dict]:
-    """Parse code and return a list of structured units.
-
-    TODO: integrate tree-sitter to extract functions, classes, imports, and calls.
-    """
+    """Parse code and return a list of structured units."""
     logger.info("Parsing repository at %s", repo_path)
-    return []
+    repo_root = Path(repo_path)
+    extensions = {".py", ".js", ".ts"}
+    units: list[dict] = []
+    for file_path in _iter_code_files(repo_path, extensions):
+        units.extend(_extract_units_from_file(file_path, repo_root))
+    logger.info("Parsed %s units", len(units))
+    return units
