@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ast
 import difflib
 import json
 import os
 import re
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -104,21 +106,54 @@ class GraphRAGPipeline:
             self._load_indexes()
 
     def _max_prompt_chars(self) -> int:
-        available_tokens = max(256, settings.ollama_num_ctx - settings.prompt_reserved_tokens)
+        available_tokens = max(256, settings.llm_num_ctx - settings.prompt_reserved_tokens)
         return int(available_tokens * settings.approx_chars_per_token)
 
-    def _ollama_timeout(self) -> tuple[int | None, int | None] | None:
-        connect_timeout: int | None = (
-            None
-            if settings.ollama_connect_timeout_s <= 0
-            else settings.ollama_connect_timeout_s
-        )
-        read_timeout: int | None = (
-            None if settings.ollama_read_timeout_s <= 0 else settings.ollama_read_timeout_s
-        )
-        if connect_timeout is None and read_timeout is None:
+    def _llm_timeout(self) -> float | None:
+        if self._is_local_llm_base():
             return None
-        return (connect_timeout, read_timeout)
+        timeout_s = float(settings.llama_timeout or 0)
+        return None if timeout_s <= 0 else timeout_s
+
+    def _is_local_llm_base(self) -> bool:
+        base = (settings.llama_api_base or "").strip()
+        if not base:
+            return False
+        candidate = base
+        if "://" not in candidate:
+            candidate = f"http://{candidate}"
+        try:
+            parsed = urlparse(candidate)
+        except Exception:
+            return False
+        host = (parsed.hostname or "").strip().lower()
+        return host in {"localhost", "127.0.0.1", "::1"}
+
+    def _llm_health_check(self) -> None:
+        """Fast preflight to avoid long hangs when the LLM endpoint is down."""
+        base = (settings.llama_api_base or "").strip().rstrip("/")
+        if not base:
+            raise ValueError("LLAMA_API_BASE is not set (or empty).")
+
+        provider = (settings.llm_provider or "").strip().lower()
+        timeout_setting = float(settings.llama_timeout or 0)
+        timeout = 5.0 if timeout_setting <= 0 else min(5.0, timeout_setting)
+
+        # Choose a lightweight endpoint per provider.
+        if provider == "ollama":
+            url = f"{base}/api/tags"
+            headers = {"Accept": "application/json"}
+        else:
+            # OpenAI-compatible: models listing.
+            url = f"{base}/models" if not base.endswith("/models") else base
+            headers = {"Accept": "application/json"}
+
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if resp.status_code >= 400:
+                raise ValueError(f"LLM preflight failed ({resp.status_code}): {resp.text[:200]}")
+        except Exception as exc:
+            raise ValueError(f"LLM endpoint not reachable at {url}: {exc}") from exc
 
     def _extract_query_terms(self, question: str) -> list[str]:
         raw_tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question)
@@ -412,7 +447,10 @@ class GraphRAGPipeline:
 
         implements: list[str] = []
         for part in implements_raw.split(","):
-            name = part.strip().split()[0].strip()
+            tokens = part.strip().split()
+            if not tokens:
+                continue
+            name = tokens[0].strip()
             if not name:
                 continue
             name = re.sub(r"<.*?>", "", name).strip()
@@ -904,117 +942,335 @@ class GraphRAGPipeline:
         }
         return context, retrieved_items, meta
 
-    def _query_ollama(self, question: str, context: str) -> str:
-        stream = bool(settings.ollama_stream)
-        payload = {
-            "model": settings.llm_model,
-            "prompt": self._build_prompt(question, context),
-            "stream": stream,
-            "options": {"num_ctx": settings.ollama_num_ctx},
-        }
-        generate_url = f"{settings.ollama_base_url}/api/generate"
-        response = requests.post(
-            generate_url,
-            json=payload,
-            timeout=self._ollama_timeout(),
-            stream=stream,
+    def _try_answer_simple_math(self, question: str) -> str | None:
+        raw = (question or "").strip()
+        if not raw:
+            return None
+
+        normalized = re.sub(r"[\s\?=]+$", "", raw).strip()
+        if not normalized:
+            return None
+
+        match = re.fullmatch(
+            r"(?is)\s*(?:what\s+is|calculate|compute|eval(?:uate)?)\s+(?P<expr>.+?)\s*",
+            normalized,
         )
-        if response.status_code == 404:
-            chat_url = f"{settings.ollama_base_url}/api/chat"
-            chat_payload = {
-                "model": settings.llm_model,
-                "messages": [
-                    {"role": "user", "content": self._build_prompt(question, context)}
-                ],
-                "stream": stream,
-                "options": {"num_ctx": settings.ollama_num_ctx},
-            }
-            chat_response = requests.post(
-                chat_url,
-                json=chat_payload,
-                timeout=self._ollama_timeout(),
-                stream=stream,
+        expr = (match.group("expr") if match else normalized).strip()
+        if not expr or len(expr) > 200:
+            return None
+
+        if re.search(r"[A-Za-z_]", expr):
+            return None
+        if not re.fullmatch(r"[0-9\.\s\+\-\*\/%\(\)]+", expr):
+            return None
+
+        try:
+            value = self._safe_eval_arithmetic(expr)
+        except Exception:
+            return None
+
+        if isinstance(value, float):
+            if value == 0.0:
+                return "0"
+            if value.is_integer():
+                return str(int(value))
+        return str(value)
+
+    def _safe_eval_arithmetic(self, expr: str) -> int | float:
+        tree = ast.parse(expr, mode="eval")
+
+        def eval_node(node: ast.AST) -> int | float:
+            if isinstance(node, ast.Constant):
+                value = node.value
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError("unsupported literal")
+                return value
+            if isinstance(node, ast.Num):  # pragma: no cover (py<3.8)
+                value = node.n
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError("unsupported literal")
+                return value
+            if isinstance(node, ast.UnaryOp):
+                operand = eval_node(node.operand)
+                if isinstance(node.op, ast.UAdd):
+                    return +operand
+                if isinstance(node.op, ast.USub):
+                    return -operand
+                raise ValueError("unsupported unary op")
+            if isinstance(node, ast.BinOp):
+                left = eval_node(node.left)
+                right = eval_node(node.right)
+                op = node.op
+                if isinstance(op, ast.Add):
+                    return left + right
+                if isinstance(op, ast.Sub):
+                    return left - right
+                if isinstance(op, ast.Mult):
+                    return left * right
+                if isinstance(op, ast.Div):
+                    return left / right
+                if isinstance(op, ast.FloorDiv):
+                    return left // right
+                if isinstance(op, ast.Mod):
+                    return left % right
+                if isinstance(op, ast.Pow):
+                    if isinstance(right, (int, float)) and abs(right) > 10_000:
+                        raise ValueError("power too large")
+                    return left**right
+                raise ValueError("unsupported binary op")
+            raise ValueError("unsupported expression")
+
+        return eval_node(tree.body)
+
+    def _llm_endpoint_candidates(self) -> list[str]:
+        base = (settings.llama_api_base or "").strip()
+        if not base:
+            return []
+        base = base.rstrip("/")
+
+        provider = (settings.llm_provider or "").strip().lower()
+        if provider == "ollama":
+            # Prefer native Ollama endpoints; fall back to OpenAI-compatible if user points to /v1.
+            if base.lower().endswith("/v1"):
+                return [f"{base}/chat/completions"]
+            if base.lower().endswith("/api"):
+                return [f"{base}/chat", f"{base}/generate"]
+            return [f"{base}/api/chat", f"{base}/api/generate", f"{base}/v1/chat/completions"]
+
+        if re.search(r"(?i)(/chat/completions|/completions|:generatecontent)$", base):
+            return [base]
+
+        candidates = [
+            f"{base}/v1/chat/completions",
+            f"{base}/openai/v1/chat/completions",
+            f"{base}/chat/completions",
+            f"{base}/v1/completions",
+            f"{base}/openai/v1/completions",
+            base,
+        ]
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for url in candidates:
+            if url in seen:
+                continue
+            seen.add(url)
+            ordered.append(url)
+        return ordered
+
+    def _llm_auth_header_sets(self) -> list[dict[str, str]]:
+        base_headers = {"Content-Type": "application/json"}
+        api_key = (settings.llama_api_key or "").strip()
+        if not api_key:
+            return [base_headers]
+
+        provider = (settings.llm_provider or "").strip().lower()
+        if provider == "gemini":
+            return [
+                {**base_headers, "x-goog-api-key": api_key},
+                {**base_headers, "Authorization": f"Bearer {api_key}"},
+                {**base_headers, "x-api-key": api_key},
+            ]
+
+        return [
+            {**base_headers, "Authorization": f"Bearer {api_key}"},
+            {**base_headers, "x-api-key": api_key},
+            {**base_headers, "x-goog-api-key": api_key},
+        ]
+
+    def _extract_text_from_llm_response(self, data: Any) -> str:
+        if isinstance(data, str):
+            return data.strip()
+
+        if not isinstance(data, dict):
+            return ""
+
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0] or {}
+            if isinstance(first, dict):
+                message = first.get("message") or {}
+                if isinstance(message, dict):
+                    content = message.get("content")
+                    if isinstance(content, str) and content.strip():
+                        return content.strip()
+                text = first.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+                delta = first.get("delta") or {}
+                if isinstance(delta, dict):
+                    content = delta.get("content")
+                    if isinstance(content, str) and content.strip():
+                        return content.strip()
+
+        response_text = data.get("response")
+        if isinstance(response_text, str) and response_text.strip():
+            return response_text.strip()
+
+        output_text = data.get("output")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        # Gemini-style response: candidates[].content.parts[].text
+        candidates = data.get("candidates")
+        if isinstance(candidates, list) and candidates:
+            cand0 = candidates[0] or {}
+            if isinstance(cand0, dict):
+                content = cand0.get("content") or {}
+                if isinstance(content, dict):
+                    parts = content.get("parts")
+                    if isinstance(parts, list):
+                        texts: list[str] = []
+                        for part in parts:
+                            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                                text = part.get("text") or ""
+                                if text.strip():
+                                    texts.append(text.strip())
+                        if texts:
+                            return "\n".join(texts).strip()
+
+        return ""
+
+    def _query_llm(self, question: str, context: str) -> str:
+        endpoints = self._llm_endpoint_candidates()
+        if not endpoints:
+            raise ValueError("LLAMA_API_BASE is not set (or empty).")
+
+        # Quick preflight to fail fast if the endpoint is down.
+        self._llm_health_check()
+
+        prompt = self._build_prompt(question, context)
+        model_name = (settings.llama_model_name or "").strip()
+        if not model_name:
+            raise ValueError("LLAMA_MODEL_NAME is not set (or empty).")
+
+        provider = (settings.llm_provider or "").strip().lower()
+        api_key_present = bool((settings.llama_api_key or "").strip())
+        last_error: Exception | None = None
+
+        for url in endpoints:
+            is_chat = url.rstrip("/").lower().endswith("/chat/completions")
+            is_completion = (
+                url.rstrip("/").lower().endswith("/completions") and not is_chat
             )
-            if chat_response.status_code != 404:
-                chat_response.raise_for_status()
-                if stream:
-                    return self._read_chat_stream(chat_response)
-                data = chat_response.json()
-                message = data.get("message", {})
-                return message.get("content", "").strip()
-            return self._ollama_not_found_message()
-        response.raise_for_status()
-        if stream:
-            return self._read_generate_stream(response)
-        data = response.json()
-        return data.get("response", "").strip()
+            is_gemini_generate = "generatecontent" in url.lower()
+            is_ollama_chat = url.rstrip("/").lower().endswith("/api/chat")
+            is_ollama_generate = url.rstrip("/").lower().endswith("/api/generate")
 
-    def _read_generate_stream(self, response: requests.Response) -> str:
-        parts: list[str] = []
-        try:
-            for line in response.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
+            if is_ollama_chat or (provider == "ollama" and not (is_chat or is_completion or is_gemini_generate)):
+                payload: dict[str, Any] = {
+                    "model": model_name,
+                    "stream": False,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "options": {"num_ctx": int(settings.llm_num_ctx)},
+                }
+                header_sets = [{"Content-Type": "application/json"}]
+            elif is_ollama_generate:
+                payload = {
+                    "model": model_name,
+                    "stream": False,
+                    "prompt": prompt,
+                    "options": {"num_ctx": int(settings.llm_num_ctx)},
+                }
+                header_sets = [{"Content-Type": "application/json"}]
+            elif is_gemini_generate:
+                payload: dict[str, Any] = {
+                    "model": model_name,
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                }
+                header_sets = self._llm_auth_header_sets()
+            elif is_completion:
+                payload = {"model": model_name, "prompt": prompt}
+                header_sets = self._llm_auth_header_sets()
+            else:
+                payload = {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                header_sets = self._llm_auth_header_sets()
+
+            for headers in header_sets:
+                response: requests.Response | None = None
                 try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                chunk = data.get("response")
-                if chunk:
-                    parts.append(chunk)
-                if data.get("done") is True:
-                    break
-        finally:
-            response.close()
-        return "".join(parts).strip()
-
-    def _read_chat_stream(self, response: requests.Response) -> str:
-        parts: list[str] = []
-        try:
-            for line in response.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                message = data.get("message") or {}
-                chunk = message.get("content")
-                if chunk:
-                    parts.append(chunk)
-                if data.get("done") is True:
-                    break
-        finally:
-            response.close()
-        return "".join(parts).strip()
-
-    def _ollama_not_found_message(self) -> str:
-        try:
-            tags_url = f"{settings.ollama_base_url}/api/tags"
-            tags_response = requests.get(tags_url, timeout=self._ollama_timeout())
-            if tags_response.ok:
-                models = [
-                    model.get("name")
-                    for model in tags_response.json().get("models", [])
-                    if model.get("name")
-                ]
-                if models:
-                    model_list = ", ".join(models[:10])
-                    return (
-                        "Ollama endpoint not found or model missing. "
-                        f"Available models: {model_list}. "
-                        "Update settings.llm_model to match one of these."
+                    response = requests.post(
+                        url,
+                        json=payload,
+                        headers=headers,
+                        timeout=self._llm_timeout(),
                     )
-        except requests.RequestException:
-            pass
-        return (
-            "Ollama endpoint not found or model missing. "
-            "Ensure Ollama is running and settings.llm_model matches `ollama list`."
-        )
+
+                    if response.status_code == 404:
+                        break
+
+                    if response.status_code in (401, 403) and api_key_present:
+                        last_error = requests.HTTPError(
+                            f"HTTP {response.status_code} (auth failed)", response=response
+                        )
+                        continue
+
+                    try:
+                        response.raise_for_status()
+                    except requests.HTTPError as exc:
+                        body = (response.text or "").strip()
+                        detail = body[:800] + ("..." if len(body) > 800 else "")
+                        raise requests.HTTPError(
+                            f"{exc} - {detail}" if detail else str(exc),
+                            response=response,
+                        ) from None
+
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        data = {"raw": (response.text or "").strip()}
+
+                    text = self._extract_text_from_llm_response(data)
+                    if text:
+                        return text
+
+                    # Ollama native format: {"message": {"content": "..."}}
+                    if isinstance(data, dict):
+                        message = data.get("message")
+                        if isinstance(message, dict):
+                            content = message.get("content")
+                            if isinstance(content, str) and content.strip():
+                                return content.strip()
+                        resp_text = data.get("response")
+                        if isinstance(resp_text, str) and resp_text.strip():
+                            return resp_text.strip()
+
+                    last_error = ValueError("LLM response did not contain any text.")
+                except Exception as exc:
+                    last_error = exc
+                finally:
+                    if response is not None:
+                        response.close()
+
+        if last_error is not None:
+            raise last_error
+        raise ValueError("LLM request failed: no working endpoint found.")
 
     def answer_with_debug(self, question: str, *, k: int = 5, debug: bool = False) -> str | dict[str, Any]:
         logger.info("Received question: %s", question)
         self._reload_if_stale()
+
+        math_answer = self._try_answer_simple_math(question)
+        if math_answer is not None:
+            payload = {"answer": math_answer, "retrieved": [], "meta": {"fast_path": "math"}}
+            return payload if debug else math_answer
+
+        if not (settings.llama_api_base or "").strip():
+            message = "LLAMA_API_BASE is not set (or empty). Set it in `.env` (or as an environment variable) and restart the API."
+            payload = {
+                "answer": message,
+                "retrieved": [],
+                "meta": {
+                    "llm_provider": settings.llm_provider,
+                    "llama_api_base": settings.llama_api_base,
+                    "llama_model_name": settings.llama_model_name,
+                    "llama_timeout_s": settings.llama_timeout,
+                },
+            }
+            return payload if debug else message
+
         if not self.vector_store or not self.metadata:
             # Try to reload in case indexing completed after app startup.
             self._load_indexes()
@@ -1023,6 +1279,24 @@ class GraphRAGPipeline:
                 "Vector index is missing. Run the indexer to build embeddings and graph data."
             )
             return {"answer": message} if debug else message
+
+        # Detect embedding dimension mismatches (e.g., switching embedding backends).
+        try:
+            probe_vec = self._get_embedder().encode(["dimension_probe"])[0]
+            expected_dim = len(probe_vec)
+        except Exception as exc:
+            message = f"Embedding backend failed to initialize: {exc}"
+            return {"answer": message} if debug else message
+
+        actual_dim = int(getattr(self.vector_store, "dim", 0) or 0)
+        if actual_dim and expected_dim and actual_dim != expected_dim:
+            message = (
+                "Embedding dimension mismatch between the saved FAISS index and the current embedding backend. "
+                f"Index dim={actual_dim}, embedder dim={expected_dim}. "
+                "Re-run indexing to rebuild the vector store with the current settings."
+            )
+            payload = {"answer": message, "retrieved": [], "meta": {"index_dim": actual_dim, "embedder_dim": expected_dim}}
+            return payload if debug else message
 
         scores, indices, retrieval_meta = self._hybrid_search(question, k=k)
 
@@ -1033,23 +1307,14 @@ class GraphRAGPipeline:
         context, retrieved, meta = self._build_context(
             scores, indices, question=question, max_chars=max_chars, preface=preface
         )
-        ollama_timeout = self._ollama_timeout()
-        if ollama_timeout is None:
-            connect_timeout = None
-            read_timeout = None
-        else:
-            connect_timeout, read_timeout = ollama_timeout
         meta.update(
             {
                 "k": k,
-                "ollama_model": settings.llm_model,
-                "ollama_base_url": settings.ollama_base_url,
-                "ollama_stream": bool(settings.ollama_stream),
-                "ollama_timeout_s": {
-                    "connect": connect_timeout,
-                    "read": read_timeout,
-                },
-                "ollama_num_ctx": settings.ollama_num_ctx,
+                "llm_provider": settings.llm_provider,
+                "llama_api_base": settings.llama_api_base,
+                "llama_model_name": settings.llama_model_name,
+                "llama_timeout_s": settings.llama_timeout,
+                "llm_num_ctx": settings.llm_num_ctx,
             }
         )
         meta.update(retrieval_meta)
@@ -1058,10 +1323,10 @@ class GraphRAGPipeline:
             return {"answer": message, "retrieved": retrieved, "meta": meta} if debug else message
 
         try:
-            answer = self._query_ollama(question, context)
-        except requests.RequestException as exc:
-            logger.error("Ollama request failed: %s", exc)
-            error_message = f"Ollama request failed: {exc}"
+            answer = self._query_llm(question, context)
+        except Exception as exc:
+            logger.error("LLM request failed: %s", exc)
+            error_message = f"LLM request failed: {exc}"
             return (
                 {
                     "answer": error_message,

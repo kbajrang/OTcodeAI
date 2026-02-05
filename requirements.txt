@@ -2,12 +2,10 @@ fastapi
 uvicorn
 streamlit
 networkx
-llama-index
 faiss-cpu
-sentence-transformers
+scikit-learn
 numpy
 python-dotenv
 pydantic
 pydantic-settings
-tree-sitter
 requests

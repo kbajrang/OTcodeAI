@@ -8,10 +8,11 @@ from typing import Callable
 
 from pydantic import BaseModel
 
+from src.config.settings import settings
 from src.embeddings.bge import BGEEmbedder
 from src.graph.build_graph import build_code_graph
 from src.graph.store import save_graph
-from src.parsers.treesitter_parser import parse_repository
+from src.parsers.lightweight_parser import parse_repository
 from src.utils.logging import get_logger
 from src.vector_store.faiss_store import FaissStore
 from src.vector_store.metadata import save_metadata
@@ -198,9 +199,15 @@ def run(
         if on_stage:
             on_stage("embeddings", f"Embedding {len(texts)} chunks")
         embedder = BGEEmbedder()
-        vectors = embedder.encode(texts)
-        store = FaissStore(dim=len(vectors[0]))
-        store.add(vectors)
+        store = FaissStore(dim=None)
+        batch_size = max(1, int(settings.embedding_batch_size))
+
+        for start in range(0, len(texts), batch_size):
+            end = min(len(texts), start + batch_size)
+            if on_stage and start > 0:
+                on_stage("embeddings", f"Embedding chunks {start+1}-{end} / {len(texts)}")
+            vectors = embedder.encode(texts[start:end], batch_size=batch_size)
+            store.add(vectors)
         store.save()
         save_metadata(metadata)
         stats.vector_entries = len(metadata)

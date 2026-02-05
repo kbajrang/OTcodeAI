@@ -10,13 +10,24 @@ DEFAULT_SAMPLE_PATH = (
     r"C:\Users\bkailasa\Desktop\zenworks\zenworks-rest-api\zenworks-rest-core"
 )
 
-st.set_page_config(page_title="GraphRAG Code Intelligence", layout="wide")
+st.set_page_config(page_title="GraphRAG Code Intelligence", layout="wide", initial_sidebar_state="expanded")
 
 st.title("GraphRAG Code Intelligence")
 
 api_base_url = st.sidebar.text_input(
     "API base URL",
     value=os.getenv("OTCODEAI_API_URL", "http://localhost:8000"),
+)
+
+st.sidebar.divider()
+st.sidebar.subheader("Local LLM (Ollama)")
+st.sidebar.caption(
+    "Run Ollama locally and pull a model like `codellama:13b`. "
+    "Set these in `.env` and restart the API."
+)
+st.sidebar.code(
+    "LLM_PROVIDER=ollama\nLLAMA_API_BASE=http://localhost:11434\nLLAMA_MODEL_NAME=codellama:13b",
+    language="text",
 )
 
 
@@ -41,11 +52,16 @@ with st.sidebar:
             st.error(f"API error: {health.status_code}")
     except requests.RequestException as exc:
         st.error(f"API unreachable: {exc}")
-        st.caption("Start it with `.\\scripts\\run_all.ps1` (starts API + UI) or run `python -m uvicorn src.main:app --reload --host 0.0.0.0 --port 8000`.")
+        st.caption(
+            "Start it with `.\\scripts\\run_all.ps1` (starts API + UI) or run "
+            "`.\\.venv\\Scripts\\python.exe` (or `.\\venv\\Scripts\\python.exe`) "
+            "`-m uvicorn src.main:app --reload --host 0.0.0.0 --port 8000` "
+            "(or activate your venv and run the same command)."
+        )
 
-tabs = st.tabs(["Workspace", "Index", "Ask"])
+tabs = st.tabs(["Ask", "Index", "Workspace"])
 
-with tabs[0]:
+with tabs[2]:
     st.subheader("Modules")
 
     col_left, col_right = st.columns(2)
@@ -133,10 +149,14 @@ with tabs[1]:
     except requests.RequestException as exc:
         st.error(str(exc))
 
-with tabs[2]:
-    st.subheader("Ask")
+with tabs[0]:
+    st.subheader("Ask (Graph-guided RAG)")
 
-    question = st.text_area("Question", height=120)
+    question = st.text_area(
+        "Question",
+        height=120,
+        placeholder="Ask about architecture, call flow, dependencies, or a specific symbol…",
+    )
     col_k, col_debug, col_btn = st.columns([1, 1, 2])
     with col_k:
         k = st.number_input("Top-K", min_value=1, max_value=25, value=5, step=1)
@@ -165,7 +185,7 @@ with tabs[2]:
                     st.json(meta)
                 with st.expander("Retrieved items", expanded=True):
                     st.dataframe(retrieved, use_container_width=True)
-                with st.expander("Context sent to Ollama", expanded=False):
+                with st.expander("Context sent to LLM", expanded=False):
                     st.text_area("Context", value=data.get("context", ""), height=300)
                 with st.expander("Prompt (preview)", expanded=False):
                     prompt = data.get("prompt", "")

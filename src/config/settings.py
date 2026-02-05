@@ -1,15 +1,32 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from src.utils.paths import PROJECT_ROOT
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=str(PROJECT_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+    )
+
     # Models
-    llm_model: str = "codellama:13b-instruct"
+    # Providers: "ollama" (recommended for local), or "openai_compat"
+    llm_provider: str = "ollama"
+    # For Ollama, set to "http://localhost:11434"
+    # For OpenAI-compatible servers, set to e.g. "http://localhost:8001/v1"
+    llama_api_base: str = "http://localhost:11434"
+    llama_api_key: str = ""
+    # Ollama example: "codellama:13b" (or your pulled tag)
+    llama_model_name: str = "codellama:13b"
+    # Keep this low so UI errors fast if Ollama isn't running.
+    llama_timeout: int = 0
     embedding_model: str = "BAAI/bge-base-en"
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_connect_timeout_s: int = 10
-    ollama_read_timeout_s: int = 600
-    ollama_stream: bool = True
-    ollama_num_ctx: int = 4096
+    embedding_batch_size: int = 32
+    # When sentence-transformers is unavailable, we fall back to hashing embeddings.
+    # Keep this at 768 by default to match common BGE dimensions and avoid FAISS dim mismatches.
+    fallback_embedding_dim: int = 768
+    llm_num_ctx: int = 4096
     prompt_reserved_tokens: int = 512
     approx_chars_per_token: int = 4
 
